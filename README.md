@@ -5,6 +5,7 @@
 按 cue id 执行三方合并，检测字段级冲突、删除/修改冲突与时间轴重叠。
 `POST /resolve` 进一步支持对识别出的冲突提交人工决策，输出解决后的时间轴。
 `POST /retime` 则按 source/target 时间锚点对 cue 时间轴做分段线性校时（重映射）。
+`POST /splice` 按选区列表从现有 cue 时间轴剪取字幕，并依列表顺序拼成一条新时间轴。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -309,6 +310,105 @@ curl -X POST http://localhost:8000/retime \
 {"status":"retime_error","cue_ids":["a"]}
 ```
 
+### POST /splice
+
+从一条现有 cue 时间轴（`cues`）按**选区列表**（`selections`）剪取字幕，并依
+**列表顺序**拼成一条新时间轴。选区可乱序、相互重叠或重复；每个选区贡献固定
+时长（`end - start`），因此第 `i` 个选区之前全部选区时长之和，就是该选区所产
+片段在新时间轴上的偏移；选区中的空白（与任何 cue 都不相交的部分，含超出源时
+间轴的部分）同样计入总时长。
+
+请求体：
+
+| 字段         | 类型        | 说明                                                                          |
+| ------------ | ----------- | ----------------------------------------------------------------------------- |
+| `cues`       | Cue[]       | 源时间轴 cue 列表（可空）；id 不得重复，时间轴不得严格重叠（首尾相接允许）      |
+| `selections` | Selection[] | 选区列表（可空），**顺序即拼接顺序**；允许乱序、重叠或重复                      |
+
+Selection 结构（时间单位为秒，支持小数）：
+
+```json
+{"start": 10.0, "end": 15.0}
+```
+
+- `start` / `end`：选区端点，均须非负，且 `end > start`；
+- 选区可指向源时间轴之外（不报错），超出部分作为空白计入总时长。
+
+剪取规则：
+
+1. 每条源 cue 只取与选区**严格相交**的部分（交集时长 > 0；仅端点相接
+   `cue.end == sel.start` 不算相交，不产出片段）；
+2. 跨选区边界的 cue 在边界处**裁断**，只保留落在选区内的部分；
+3. 片段在新时间轴上的 `start` = 此前选区总时长 + 交集起点相对本选区起点的时间，
+   `end` 同理（交集为 `[max(cue.start, sel.start), min(cue.end, sel.end))`）；
+4. `text` 与 `speaker` 原样保留，不做任何改写；
+5. 同一源 cue 被多个选区选中时，每个选区各生成一个片段，片段 `id` 互不相同
+   （格式 `<原 cue id>#<选区序号>`），并通过 `source_id` 与 `selection`
+   （请求 `selections` 中的 0 基序号）保留原 id 与选区序号；
+6. 片段按选区顺序输出；同一选区内按源时间顺序（交集起点）排列。
+
+#### 错误与响应
+
+- 选区端点为负、`end <= start`、源 cue id 重复、源时间轴严格重叠等参数问题 →
+  `422`（请求体校验失败，不输出部分结果）；
+- `selections` 为空（或缺省）时返回空 `cues` 与 `total_duration = 0`。
+
+成功响应 `200`：
+
+```json
+{
+  "status": "spliced",
+  "cues": [
+    {
+      "id": "a#0",
+      "source_id": "a",
+      "selection": 0,
+      "start": 0.0,
+      "end": 3.0,
+      "text": "你好",
+      "speaker": null
+    }
+  ],
+  "count": 1,
+  "total_duration": 3.0
+}
+```
+
+调用样例（`http://localhost:8000/splice`）——选区乱序且相互重叠，源 cue `a`
+被选两次、`b` 跨边界被裁断：
+
+```bash
+curl -X POST http://localhost:8000/splice \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"a","start":0.0,"end":4.0,"text":"你好","speaker":"alice"},
+      {"id":"b","start":8.0,"end":12.0,"text":"世界","speaker":null}
+    ],
+    "selections": [
+      {"start":9.0,"end":11.0},
+      {"start":1.0,"end":3.0},
+      {"start":2.0,"end":4.0}
+    ]
+  }'
+```
+
+三个选区时长各为 2，总时长 6；第一个选区只截到 `b` 的 [9,11)（偏移 0 → 0..2），
+第二、三个选区各取 `a` 的一部分（偏移分别为 2、4），同一 `a` 生成不同 id：
+
+```json
+{
+  "status": "spliced",
+  "cues": [
+    {"id":"b#0","source_id":"b","selection":0,"start":0.0,"end":2.0,"text":"世界","speaker":null},
+    {"id":"a#1","source_id":"a","selection":1,"start":3.0,"end":5.0,"text":"你好","speaker":"alice"},
+    {"id":"a#2","source_id":"a","selection":2,"start":4.0,"end":6.0,"text":"你好","speaker":"alice"}
+  ],
+  "count": 3,
+  "total_duration": 6.0
+}
+```
+
 ## 快速试用
 
 ```bash
@@ -333,12 +433,13 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/splice、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
 │   ├── retime.py     # 时间锚点分段线性校时纯逻辑
+│   ├── splice.py     # 选区剪取与顺序拼接纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 62 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 81 个端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -248,6 +248,102 @@ class RetimeSuccessResponse(BaseModel):
     count: int
 
 
+class Selection(BaseModel):
+    """剪取选区：源时间轴上的一个区间 [start, end)（秒）。"""
+
+    start: float = Field(..., ge=0, description="选区起点（秒），非负")
+    end: float = Field(..., ge=0, description="选区终点（秒），必须大于 start")
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "Selection":
+        if self.end <= self.start:
+            raise ValueError("end 必须大于 start")
+        return self
+
+
+class SpliceRequest(BaseModel):
+    """POST /splice 的请求体：源 cue 列表与按拼接顺序给出的选区列表。"""
+
+    cues: list[Cue] = Field(
+        default_factory=list,
+        description="源时间轴 cue 列表；id 不得重复，时间轴不得严格重叠（首尾相接允许）",
+    )
+    selections: list[Selection] = Field(
+        default_factory=list,
+        description=(
+            "选区列表（可空），顺序即拼接顺序；"
+            "允许乱序、相互重叠或重复，每个选区两端非负且 end > start"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_source_timeline(self) -> "SpliceRequest":
+        ids = [cue.id for cue in self.cues]
+        if len(ids) != len(set(ids)):
+            duplicated = sorted({cue_id for cue_id in ids if ids.count(cue_id) > 1})
+            raise ValueError(f"cues 中存在重复的 cue id: {', '.join(duplicated)}")
+
+        # 严格重叠（重叠时长 > 0，仅首尾相接不算）：收集所有涉及的 cue id
+        ordered = sorted(self.cues, key=lambda cue: (cue.start, cue.end, cue.id))
+        overlap_ids: list[str] = []
+        for idx, cue in enumerate(ordered):
+            for other in ordered[idx + 1 :]:
+                if other.start >= cue.end:
+                    break
+                if min(cue.end, other.end) > max(cue.start, other.start):
+                    for cue_id in (cue.id, other.id):
+                        if cue_id not in overlap_ids:
+                            overlap_ids.append(cue_id)
+        if overlap_ids:
+            raise ValueError(
+                f"源时间轴存在重叠的 cue id: {', '.join(overlap_ids)}"
+            )
+        return self
+
+
+class SpliceCue(BaseModel):
+    """拼接后新时间轴上的一条字幕片段。"""
+
+    id: str = Field(
+        ...,
+        description=(
+            "片段新 id，在结果中唯一，格式为 `<原 cue id>#<选区序号>`；"
+            "同一原 cue 被多个选区选中时，每个片段的 id 不同"
+        ),
+    )
+    source_id: str = Field(..., description="来源 cue 的原 id")
+    selection: int = Field(
+        ...,
+        ge=0,
+        description="来源选区在请求 selections 列表中的序号（0 基）",
+    )
+    start: float = Field(..., ge=0, description="片段在拼接时间轴上的起点（秒）")
+    end: float = Field(..., ge=0, description="片段在拼接时间轴上的终点（秒）")
+    text: str = Field(..., description="字幕文本，原样保留")
+    speaker: Optional[str] = Field(None, description="说话人（可选），原样保留")
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "SpliceCue":
+        if self.end <= self.start:
+            raise ValueError("end 必须大于 start")
+        return self
+
+
+class SpliceSuccessResponse(BaseModel):
+    """剪取拼接成功：cues 按选区顺序、选区内按源时间顺序返回。"""
+
+    status: Literal["spliced"] = "spliced"
+    cues: list[SpliceCue]
+    count: int
+    total_duration: float = Field(
+        ...,
+        description=(
+            "拼接后总时长（秒），等于全部选区时长之和；"
+            "选区中的空白（含与任何 cue 都不相交的选区）同样计入"
+        ),
+    )
+
+
 class HealthResponse(BaseModel):
     """健康检查响应。"""
 

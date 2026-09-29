@@ -20,8 +20,11 @@ from .models import (
     RetimeErrorResponse,
     RetimeRequest,
     RetimeSuccessResponse,
+    SpliceRequest,
+    SpliceSuccessResponse,
 )
 from .retime import retime_cues
+from .splice import splice_cues
 
 app = FastAPI(
     title="字幕时间轴三方合并 API",
@@ -30,7 +33,8 @@ app = FastAPI(
         "按 cue id 进行三方合并、字段级冲突检测与时间轴重叠检测；"
         "POST /resolve 在同一三方合并之上应用人工冲突决策，"
         "输出解决后的时间轴；"
-        "POST /retime 按 source/target 时间锚点对 cue 时间轴做分段线性校时。"
+        "POST /retime 按 source/target 时间锚点对 cue 时间轴做分段线性校时；"
+        "POST /splice 按选区列表从现有 cue 时间轴剪取字幕并按列表顺序拼接。"
     ),
     version=__version__,
 )
@@ -158,3 +162,20 @@ def retime(request: RetimeRequest):
         return JSONResponse(status_code=409, content=content)
 
     return RetimeSuccessResponse(cues=result.cues, count=len(result.cues))
+
+
+@app.post(
+    "/splice",
+    tags=["splice"],
+    response_model=SpliceSuccessResponse,
+)
+def splice(request: SpliceRequest):
+    """按选区列表从源 cue 时间轴剪取字幕，依列表顺序拼成新时间轴。
+
+    选区端点非负且 end > start；源 cue id 重复或源时间轴严格重叠等
+    参数问题由请求体校验拦截（422，不输出部分结果）。
+    """
+    cues, total_duration = splice_cues(request.cues, request.selections)
+    return SpliceSuccessResponse(
+        cues=cues, count=len(cues), total_duration=total_duration
+    )
