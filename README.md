@@ -4,7 +4,9 @@
 `base`（共同祖先）、`current`（我方修订）、`incoming`（对方修订）——
 按 cue id 执行三方合并，检测字段级冲突、删除/修改冲突与时间轴重叠。
 `POST /resolve` 进一步支持对识别出的冲突提交人工决策，输出解决后的时间轴。
-`POST /retime` 则按 source/target 时间锚点对 cue 时间轴做分段线性校时（重映射）。
+`POST /retime` 则按 source/target 时间锚点对 cue 时间轴做分段线性校时。
+`POST /cut` 按请求中的选区列表从现有 cue 时间轴剪取字幕，按列表顺序拼成一条新时间轴
+（选区可乱序、重叠或重复）。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -309,6 +311,128 @@ curl -X POST http://localhost:8000/retime \
 {"status":"retime_error","cue_ids":["a"]}
 ```
 
+### POST /cut
+
+按**选区列表**从一条现有 cue 时间轴上剪取字幕，并严格按选区在列表中的顺序
+首尾相接地拼成一条新时间轴。选区可以乱序、彼此重叠或重复出现。
+
+请求体：
+
+| 字段         | 类型        | 说明                                                                       |
+| ------------ | ----------- | -------------------------------------------------------------------------- |
+| `cues`       | Cue[]       | 源时间轴（可空）；结构同 `/merge` 的 Cue，要求 `end > start`、id 不重复、时间轴不重叠 |
+| `selections` | Selection[] | 按**此顺序**剪取并拼接的选区列表（可空）；允许乱序、重叠、重复              |
+
+Selection 结构（时间单位为秒，支持小数）：
+
+```json
+{"start": 1.0, "end": 4.0}
+```
+
+- `start` / `end`：非负数字，且 `end > start`。
+
+剪取与拼接规则：
+
+1. 对每个选区，取每条源 cue 与该选区**严格相交**的部分（交集时长 > 0；
+   仅端点相接 `cue.end == selection.start` 不算相交，不产出 cue）；
+2. 跨选区边界的 cue 在边界处**裁断**，只保留交集；**文本与说话人原样保留**，
+   不做逐字切分；
+3. 输出时间 = **此前所有选区时长之和**（`offset`）+ 交集相对本选区起点的时间
+   （`lo - selection.start`）；选区内未命中任何 cue 的**空白时段也计入总时长**，
+   表现为相邻输出 cue 之间的时间空隙；
+4. 选区处理顺序**严格以请求列表为准**（与选区时间先后无关）：乱序即按乱序拼，
+   重叠/重复选区各自独立剪取并各计一次完整时长；
+5. 同一原 cue 被多个选区（或同一选区重复出现）多次命中时，每次各生成一条新 cue，
+   `id` 形如 **`"{源id}#s{选区序号}"`**（选区序号从 1 开始，按请求列表计），
+   并通过 `source_id`、`selection` 保留原 id 与选区序号；
+6. 输出 cue 按新时间轴的 `start` 升序返回（平局依次按 `end`、`source_id`）。
+
+输出 cue 在 Cue 基础上增加两个溯源字段：
+
+| 字段        | 类型   | 说明                                   |
+| ----------- | ------ | -------------------------------------- |
+| `source_id` | string | 源时间轴中的原 cue id                  |
+| `selection` | int    | 命中该 cue 的选区序号（从 1 开始）      |
+
+#### 响应
+
+- `200` 剪取拼接成功：
+
+```json
+{
+  "status": "cut",
+  "cues": [
+    {"id": "a#s1", "start": 0.0, "end": 1.0, "text": "你好", "speaker": "alice",
+     "source_id": "a", "selection": 1}
+  ],
+  "count": 1,
+  "duration": 3.0
+}
+```
+
+  `duration` 为全部选区时长之和（空白计入），与是否命中 cue 无关。
+
+- **空选区列表**（或省略 `selections`）返回空列表与零时长：
+
+```json
+{"status": "cut", "cues": [], "count": 0, "duration": 0.0}
+```
+
+  若源 cues 为空但给了选区，同样返回空列表，`duration` 为选区时长之和。
+
+- `422 status=cut_param_error`：源 cue id 重复或源时间轴存在重叠
+  （严格相交，首尾相接不算），两类问题一并返回，**不输出部分结果**：
+
+```json
+{
+  "status": "cut_param_error",
+  "duplicate_ids": ["a"],
+  "overlaps": [
+    {"cue_ids": ["x", "y"], "start": 3.0, "end": 5.0, "overlap": 2.0}
+  ]
+}
+```
+
+- 选区端点为负、`end <= start`、cue 本身 `end <= start` 等请求体结构问题同样返回 `422`。
+
+调用样例（`http://localhost:8000/cut`）——乱序 + 重叠 + 重复选区：
+
+```bash
+curl -X POST http://localhost:8000/cut \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"a","start":0,"end":2,"text":"你好","speaker":"alice"},
+      {"id":"b","start":3,"end":6,"text":"世界"}
+    ],
+    "selections": [
+      {"start":8,"end":10},
+      {"start":1.5,"end":4},
+      {"start":4,"end":5.5},
+      {"start":1.5,"end":4}
+    ]
+  }'
+```
+
+第一个选区 `[8,10]` 未命中任何 cue，但 2 秒空白计入偏移；之后三个选区分别裁取
+（第二、三选区在 4s 处重叠，第四选区与第二选区完全重复，均各计一次完整时长），
+总时长 `2+2.5+1.5+2.5 = 8.5`：
+
+```json
+{
+  "status": "cut",
+  "cues": [
+    {"id":"a#s2","start":2.0,"end":2.5,"text":"你好","speaker":"alice","source_id":"a","selection":2},
+    {"id":"b#s2","start":3.5,"end":4.5,"text":"世界","speaker":null,"source_id":"b","selection":2},
+    {"id":"b#s3","start":4.5,"end":6.0,"text":"世界","speaker":null,"source_id":"b","selection":3},
+    {"id":"a#s4","start":6.0,"end":6.5,"text":"你好","speaker":"alice","source_id":"a","selection":4},
+    {"id":"b#s4","start":7.5,"end":8.5,"text":"世界","speaker":null,"source_id":"b","selection":4}
+  ],
+  "count": 5,
+  "duration": 8.5
+}
+```
+
 ## 快速试用
 
 ```bash
@@ -333,12 +457,13 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/cut、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
 │   ├── retime.py     # 时间锚点分段线性校时纯逻辑
+│   ├── cut.py        # 按选区列表剪取并拼接时间轴纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 62 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 85 个端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

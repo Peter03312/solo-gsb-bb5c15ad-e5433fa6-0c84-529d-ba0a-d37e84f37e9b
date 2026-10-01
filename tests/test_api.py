@@ -20,6 +20,10 @@ def anchor(source, target):
     return {"source": source, "target": target}
 
 
+def selection(start, end):
+    return {"start": start, "end": end}
+
+
 class HealthTests(unittest.TestCase):
     def test_health(self):
         resp = client.get("/health")
@@ -858,6 +862,317 @@ class RetimeTests(unittest.TestCase):
         self.assertEqual(data["status"], "retimed")
         self.assertEqual(data["cues"], [])
         self.assertEqual(data["count"], 0)
+
+
+class CutTests(unittest.TestCase):
+    def test_basic_clip_within_single_selection(self):
+        # cue 完全落在选区内：时间平移到新轴（相对选区起点）
+        body = {
+            "cues": [cue("a", 5.0, 7.0, "hello", speaker="bob")],
+            "selections": [selection(4.0, 10.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "cut")
+        self.assertEqual(data["count"], 1)
+        self.assertAlmostEqual(data["duration"], 6.0)
+        out = data["cues"][0]
+        self.assertEqual(
+            (out["id"], out["start"], out["end"], out["text"], out["speaker"]),
+            ("a#s1", 1.0, 3.0, "hello", "bob"),
+        )
+        self.assertEqual((out["source_id"], out["selection"]), ("a", 1))
+
+    def test_selection_before_timeline_offsets_by_blank(self):
+        body = {
+            "cues": [cue("a", 5.0, 7.0, "hi")],
+            "selections": [selection(0.0, 4.0), selection(4.0, 8.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        # 前一选区 4s 空白计入总时长
+        self.assertAlmostEqual(data["duration"], 8.0)
+        out = data["cues"][0]
+        self.assertEqual(out["id"], "a#s2")
+        self.assertAlmostEqual(out["start"], 5.0)
+        self.assertAlmostEqual(out["end"], 7.0)
+        self.assertEqual(out["selection"], 2)
+
+    def test_crossing_boundaries_are_truncated(self):
+        # cue [1,8] 跨越选区 [3,6]：两端都在边界处裁断
+        body = {
+            "cues": [cue("a", 1.0, 8.0, "long")],
+            "selections": [selection(3.0, 6.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertEqual((out["start"], out["end"]), (0.0, 3.0))
+        self.assertEqual(out["source_id"], "a")
+
+    def test_touching_at_boundary_produces_no_cue(self):
+        # cue 与选区仅端点相接（cue.end == sel.start）：不产出
+        body = {
+            "cues": [cue("a", 0.0, 2.0), cue("b", 5.0, 7.0)],
+            "selections": [selection(2.0, 5.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertEqual(data["count"], 0)
+        # 空白选区时长仍计入总时长
+        self.assertAlmostEqual(data["duration"], 3.0)
+
+    def test_out_of_order_selections_concatenated_in_list_order(self):
+        # 选区乱序：输出严格按列表顺序而非时间顺序
+        body = {
+            "cues": [cue("a", 0.0, 10.0, "x")],
+            "selections": [selection(8.0, 9.0), selection(1.0, 2.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual([c["id"] for c in cues], ["a#s1", "a#s2"])
+        self.assertEqual(
+            [(c["start"], c["end"], c["selection"]) for c in cues],
+            [(0.0, 1.0, 1), (1.0, 2.0, 2)],
+        )
+        self.assertAlmostEqual(resp.json()["duration"], 2.0)
+
+    def test_overlapping_selections_each_contribute_full_duration(self):
+        body = {
+            "cues": [cue("a", 0.0, 10.0, "x")],
+            "selections": [selection(0.0, 5.0), selection(3.0, 8.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertAlmostEqual(data["duration"], 10.0)
+        self.assertEqual(
+            [(c["id"], c["start"], c["end"]) for c in data["cues"]],
+            [("a#s1", 0.0, 5.0), ("a#s2", 5.0, 10.0)],
+        )
+
+    def test_repeated_selection_generates_distinct_ids_and_copies(self):
+        body = {
+            "cues": [cue("a", 0.0, 2.0, "hi")],
+            "selections": [selection(0.0, 2.0), selection(0.0, 2.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual(len(cues), 2)
+        self.assertEqual({c["id"] for c in cues}, {"a#s1", "a#s2"})
+        self.assertEqual([c["source_id"] for c in cues], ["a", "a"])
+        self.assertEqual([c["selection"] for c in cues], [1, 2])
+
+    def test_same_source_cue_hit_by_multiple_selections(self):
+        body = {
+            "cues": [cue("a", 0.0, 10.0, "x")],
+            "selections": [selection(1.0, 2.0), selection(8.0, 9.5)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual([c["id"] for c in cues], ["a#s1", "a#s2"])
+        self.assertAlmostEqual(cues[0]["start"], 0.0)
+        self.assertAlmostEqual(cues[0]["end"], 1.0)
+        self.assertAlmostEqual(cues[1]["start"], 1.0)
+        self.assertAlmostEqual(cues[1]["end"], 2.5)
+
+    def test_blank_gap_inside_concatenation_pushes_later_cues(self):
+        body = {
+            "cues": [cue("a", 0.0, 1.0), cue("b", 10.0, 11.0)],
+            "selections": [
+                selection(0.0, 5.0),    # a 命中 0-1，随后 4s 空白
+                selection(10.0, 11.0),  # b 命中
+            ],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertAlmostEqual(data["duration"], 6.0)
+        self.assertEqual([c["source_id"] for c in data["cues"]], ["a", "b"])
+        b_out = data["cues"][1]
+        self.assertAlmostEqual(b_out["start"], 5.0)
+        self.assertAlmostEqual(b_out["end"], 6.0)
+
+    def test_output_sorted_by_new_start_time(self):
+        # 每个选区输出多条；选区乱序时最终仍按新 start 全局排序
+        body = {
+            "cues": [
+                cue("c", 20.0, 21.0, "late"),
+                cue("a", 0.0, 1.0, "early"),
+                cue("b", 10.0, 11.0, "mid"),
+            ],
+            "selections": [
+                selection(10.0, 21.0),  # b 在 0-1，c 在 10-11
+                selection(0.0, 1.0),    # a 从 11 开始
+            ],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        starts = [c["start"] for c in cues]
+        self.assertEqual(starts, sorted(starts))
+        self.assertEqual(
+            [(c["source_id"], c["selection"]) for c in cues],
+            [("b", 1), ("c", 1), ("a", 2)],
+        )
+
+    def test_text_and_speaker_preserved(self):
+        body = {
+            "cues": [
+                {"id": "a", "start": 0.0, "end": 2.0, "text": "你好，世界", "speaker": "alice"}
+            ],
+            "selections": [selection(0.5, 1.5)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertEqual(out["text"], "你好，世界")
+        self.assertEqual(out["speaker"], "alice")
+
+    def test_missing_speaker_serialized_as_null(self):
+        body = {
+            "cues": [{"id": "a", "start": 0.0, "end": 2.0, "text": "x"}],
+            "selections": [selection(0.0, 2.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["cues"][0]["speaker"])
+
+    def test_empty_selections_returns_empty_and_zero(self):
+        body = {
+            "cues": [cue("a", 0.0, 2.0)],
+            "selections": [],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "cut")
+        self.assertEqual(data["cues"], [])
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["duration"], 0.0)
+
+    def test_selections_field_omitted_defaults_to_empty(self):
+        resp = client.post("/cut", json={"cues": [cue("a", 0.0, 2.0)]})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertEqual(data["duration"], 0.0)
+
+    def test_empty_cues_returns_empty_with_summed_duration(self):
+        body = {
+            "cues": [],
+            "selections": [selection(0.0, 3.0), selection(5.0, 7.5)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertAlmostEqual(data["duration"], 5.5)
+
+    def test_duplicate_source_ids_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0.0, 1.0), cue("b", 2.0, 3.0), cue("a", 4.0, 5.0)],
+            "selections": [selection(0.0, 5.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "cut_param_error")
+        self.assertEqual(data["duplicate_ids"], ["a"])
+        self.assertEqual(data["overlaps"], [])
+        self.assertNotIn("cues", data)
+
+    def test_overlapping_source_timeline_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0.0, 5.0), cue("b", 3.0, 8.0)],
+            "selections": [selection(0.0, 8.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "cut_param_error")
+        self.assertEqual(data["duplicate_ids"], [])
+        self.assertEqual(len(data["overlaps"]), 1)
+        ov = data["overlaps"][0]
+        self.assertEqual(ov["cue_ids"], ["a", "b"])
+        self.assertAlmostEqual(ov["start"], 3.0)
+        self.assertAlmostEqual(ov["end"], 5.0)
+        self.assertAlmostEqual(ov["overlap"], 2.0)
+
+    def test_duplicate_and_overlap_reported_together(self):
+        body = {
+            "cues": [
+                cue("a", 0.0, 5.0),
+                cue("a", 2.0, 6.0),
+                cue("b", 4.0, 9.0),
+            ],
+            "selections": [selection(0.0, 9.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["duplicate_ids"], ["a"])
+        self.assertTrue(len(data["overlaps"]) >= 1)
+
+    def test_touching_source_intervals_are_allowed(self):
+        # 源时间轴首尾相接（end == start）不算重叠
+        body = {
+            "cues": [cue("a", 0.0, 5.0), cue("b", 5.0, 8.0)],
+            "selections": [selection(0.0, 8.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [c["source_id"] for c in resp.json()["cues"]], ["a", "b"]
+        )
+
+    def test_invalid_selection_interval_is_422(self):
+        # end == start
+        body = {
+            "cues": [cue("a", 0.0, 1.0)],
+            "selections": [selection(2.0, 2.0)],
+        }
+        self.assertEqual(client.post("/cut", json=body).status_code, 422)
+        # end < start
+        body["selections"] = [selection(3.0, 1.0)]
+        self.assertEqual(client.post("/cut", json=body).status_code, 422)
+
+    def test_negative_selection_endpoint_is_422(self):
+        body = {
+            "cues": [cue("a", 0.0, 1.0)],
+            "selections": [{"start": -1.0, "end": 2.0}],
+        }
+        self.assertEqual(client.post("/cut", json=body).status_code, 422)
+        body["selections"] = [{"start": 0.0, "end": -0.5}]
+        self.assertEqual(client.post("/cut", json=body).status_code, 422)
+
+    def test_invalid_cue_interval_is_422(self):
+        body = {
+            "cues": [cue("a", 5.0, 2.0)],
+            "selections": [selection(0.0, 10.0)],
+        }
+        self.assertEqual(client.post("/cut", json=body).status_code, 422)
+
+    def test_fractional_second_precision(self):
+        body = {
+            "cues": [cue("a", 0.1, 0.9, "x")],
+            "selections": [selection(0.0, 0.5), selection(0.4, 1.0)],
+        }
+        resp = client.post("/cut", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertAlmostEqual(cues[0]["start"], 0.1)
+        self.assertAlmostEqual(cues[0]["end"], 0.5)
+        self.assertAlmostEqual(cues[1]["start"], 0.5)
+        self.assertAlmostEqual(cues[1]["end"], 1.0)
+        self.assertAlmostEqual(resp.json()["duration"], 1.1)
 
 
 if __name__ == "__main__":

@@ -248,6 +248,69 @@ class RetimeSuccessResponse(BaseModel):
     count: int
 
 
+class Selection(BaseModel):
+    """源时间轴上的一个选区（秒）：剪取与之严格相交的 cue 部分。"""
+
+    start: float = Field(..., ge=0, description="选区起点（秒），非负")
+    end: float = Field(..., ge=0, description="选区终点（秒），必须大于 start")
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "Selection":
+        if self.end <= self.start:
+            raise ValueError("end 必须大于 start")
+        return self
+
+
+class SplicedCue(Cue):
+    """拼接结果中的一条字幕：时间已重排，并溯源到原 cue 与选区序号。"""
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        description='新生成的唯一 id，形如 "{源id}#s{选区序号}"',
+    )
+    source_id: str = Field(..., min_length=1, description="源时间轴中的原 cue id")
+    selection: int = Field(
+        ..., ge=1, description="命中该 cue 的选区序号（从 1 开始，按请求列表）"
+    )
+
+
+class CutRequest(BaseModel):
+    """POST /cut 的请求体：源 cue 列表与按序拼接的选区列表。"""
+
+    cues: list[Cue] = Field(
+        default_factory=list, description="源 cue 列表；id 不得重复，时间轴不得重叠"
+    )
+    selections: list[Selection] = Field(
+        default_factory=list,
+        description="按此顺序剪取并拼接的选区列表，可乱序、重叠或重复；可为空",
+    )
+
+
+class CutParamErrorResponse(BaseModel):
+    """源时间轴参数错误（重复 cue id 或时间轴重叠）时的 422 响应：不输出部分结果。"""
+
+    status: Literal["cut_param_error"] = "cut_param_error"
+    duplicate_ids: list[str] = Field(
+        default_factory=list,
+        description="源 cues 中重复的全部 cue id（按字典序去重）",
+    )
+    overlaps: list[Overlap] = Field(
+        default_factory=list, description="源时间轴上的区间重叠"
+    )
+
+
+class CutSuccessResponse(BaseModel):
+    """剪取拼接成功：cues 已按新时间轴的开始时间排序。"""
+
+    status: Literal["cut"] = "cut"
+    cues: list[SplicedCue]
+    count: int
+    duration: float = Field(
+        ..., ge=0, description="拼接后总时长（全部选区时长之和，空白计入），单位秒"
+    )
+
+
 class HealthResponse(BaseModel):
     """健康检查响应。"""
 
